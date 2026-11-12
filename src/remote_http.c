@@ -615,13 +615,14 @@ static const char default_top[] =
     "<nav class=\"boards\"><span>Showing: {BOARD_LABEL}</span><span>Path: {CURRENT_PATH}</span>{PARENT_LINK}<a href=\"{R3_URL}\">R3 cores</a> <a href=\"{R6_URL}\">R6 cores</a> <a class=\"fetch-now\" href=\"{FETCH_NOW_URL}\">Check for updated cores</a></nav>"
     "<table><thead><tr><th>Core</th><th>Modified</th><th>Bytes</th><th>Actions</th></tr></thead><tbody>\n";
 static const char default_row[] =
-    "<tr class=\"entry-row\" data-kind=\"{TYPE}\"><td><a class=\"start\" href=\"{PRIMARY_URL}\">{PRIMARY_LABEL}</a>"
+    "<tr class=\"entry-row\" data-kind=\"{TYPE}\" data-name=\"{FILENAME_ESCAPED}\"><td><a class=\"start\" href=\"{PRIMARY_URL}\">{PRIMARY_LABEL}</a>"
     "<a class=\"core-name\" href=\"{PRIMARY_URL}\">{FILENAME}</a><div class=\"meta\">{CORE_META}</div></td>"
     "<td>{MODIFIED}</td><td>{SIZE}</td><td>{ACTIONS}</td></tr>\n";
 static const char default_bottom[] =
     "</tbody></table><script>"
     "function launchCoreLink(){return true;}"
     "function deleteCore(){alert('Delete requires the WWW interface files on the SD card.');}"
+    "function deleteFolder(){deleteCore();}"
     "</script></main></body></html>\n";
 static const char default_busy[] =
     "<!doctype html><html><head><meta charset=\"utf-8\">"
@@ -790,6 +791,33 @@ static bool safe_file_path(const char *path)
     if (strchr(path, '\\') || strchr(path, ':') || strchr(path, '*') || strchr(path, '?')) return false;
     if (path_starts_with_ci(path, "WWW/") || path_starts_with_ci(path, "DOWNLOADS/")) return false;
     return has_core_ext(path) || has_manifest_ext(path);
+}
+
+static bool path_is_or_under_ci(const char *path, const char *dir)
+{
+    size_t n = strlen(dir);
+    if (strncasecmp(path, dir, n) != 0) return false;
+    return path[n] == 0 || path[n] == '/';
+}
+
+// A folder the web UI may create or delete: relative, no "..", not the root,
+// and never one of the firmware's own folders.
+static bool safe_folder_path(const char *path)
+{
+    if (!path || !path[0]) return false;
+    size_t n = strlen(path);
+    if (n > 180) return false;
+    if (path[0] == '/' || path[n - 1] == '/') return false;
+    if (strstr(path, "..") || strstr(path, "//")) return false;
+    for (const char *p = path; *p; p++) {
+        unsigned char ch = (unsigned char)*p;
+        if (ch < 0x20 || strchr("\\:*?\"<>|", ch)) return false;
+    }
+    if (path_is_or_under_ci(path, "WWW") || path_is_or_under_ci(path, "DOWNLOADS") ||
+        path_is_or_under_ci(path, M65_THEME_DIR_PATH)) {
+        return false;
+    }
+    return true;
 }
 
 static bool safe_manifest_source_path(const char *path, manifest_kind_t kind)
@@ -2096,7 +2124,13 @@ static void substitution_value(const char *name,
             snprintf(out, out_len, "/delete?file=%s", encoded);
         }
     } else if (ci_equal(name, "ACTIONS")) {
-        if (is_dir || is_partial || is_theme) {
+        if (is_dir && safe_folder_path(file_path)) {
+            url_encode(file_path, encoded, sizeof encoded);
+            js_string_escape(file_name ? file_name : "", js_name, sizeof js_name);
+            snprintf(out, out_len,
+                     "<button class=\"delete\" type=\"button\" onclick=\"deleteFolder('/rmdir?path=%s','%s')\">delete</button>",
+                     encoded, js_name);
+        } else if (is_dir || is_partial || is_theme) {
             snprintf(out, out_len, "");
         } else {
             url_encode(file_path ? file_path : "", encoded, sizeof encoded);
@@ -2605,29 +2639,27 @@ static err_t send_theme_install(http_conn_t *c)
 }
 
 // Built into the firmware (not WWW/app.js) so it works whatever is, or isn't,
-// on the card. Polls /sd-state and shows a reload banner when the card changes.
-// Polling continues after the banner appears so its text tracks a remove ->
-// insert sequence. The server handles one connection at a time, so polling pauses briefly after
-// any click/submit to keep the user's own request from colliding with a poll.
+// on the card. Polls /sd-state and reloads the page as soon as the card's
+// generation changes (card swapped or removed, or files added, deleted or
+// renamed by anyone), so the list is never stale and nobody has to click.
+// It holds off while window.m65Busy is set: the page's own upload/delete
+// sequence is running and will reload by itself when it finishes. The
+// server handles one connection at a time, so polling also pauses briefly
+// after any click/submit to keep the user's own request from colliding.
 static const char sd_watch_script_fmt[] =
     "<script>(function(){"
-    "var g='%lu',b=null,quietUntil=0;"
+    "var g='%lu',quietUntil=0;"
     "function quiet(){quietUntil=Date.now()+8000;}"
     "document.addEventListener('click',quiet,true);"
     "document.addEventListener('submit',quiet,true);"
-    "function show(present){"
-    "if(!b){b=document.createElement('div');b.setAttribute('role','status');"
-    "b.style.cssText='position:fixed;left:0;right:0;top:0;z-index:9999;padding:10px 16px;"
-    "background:#ffd34d;color:#111;font:600 14px Arial,sans-serif;text-align:center;cursor:pointer';"
-    "b.onclick=function(){location.reload();};document.body.appendChild(b);}"
-    "b.textContent=(present?'SD card changed':'SD card removed')+' \\u2014 click to reload';}"
     "function poll(){"
-    "if(document.hidden||Date.now()<quietUntil)return;"
+    "if(document.hidden||window.m65Busy||Date.now()<quietUntil)return;"
     "var x=new XMLHttpRequest();x.open('GET','/sd-state',true);x.timeout=4000;"
-    "x.onload=function(){if(x.status!==200)return;"
+    "x.onload=function(){if(x.status!==200||window.m65Busy)return;"
     "var m=/gen=(\\d+)/.exec(x.responseText);"
-    "if(m&&m[1]!==g)show(/present=1/.test(x.responseText));};"
+    "if(m&&m[1]!==g)location.reload();};"
     "x.send();}"
+    "document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});"
     "setInterval(poll,3000);"
     "})();</script>\n";
 
@@ -2675,7 +2707,7 @@ static void index_append_sd_problem(page_builder_t *pb, const char *dir_path)
         snprintf(row, sizeof row,
                  "<tr><td colspan=\"4\"><strong>No SD card inserted.</strong>"
                  "<div class=\"meta\">Insert a card with your cores on it. "
-                 "This page will offer to reload once the card is detected.</div></td></tr>\n");
+                 "This page will reload by itself once the card is detected.</div></td></tr>\n");
     } else if (!storage_is_mounted()) {
         snprintf(row, sizeof row,
                  "<tr><td colspan=\"4\"><strong>The SD card can't be read.</strong>"
@@ -2866,6 +2898,45 @@ static err_t delete_file(http_conn_t *c, const char *path)
     if (!safe_file_path(path)) return send_error(c, 400, "Bad Request", "unsafe or unsupported file path");
     if (!storage_delete(path)) return send_error(c, 500, "Internal Server Error", storage_last_error());
     return send_response(c, 200, "OK", "text/plain", "OK DELETE DONE\n");
+}
+
+static err_t make_folder(http_conn_t *c, const char *path)
+{
+    if (!check_perm(c, REMOTE_AUTH_FILES)) return send_error(c, 403, "Forbidden", "folder changes are not authorised");
+    if (!check_write_grant()) return send_error(c, 423, "Locked", "write grant is not active");
+    if (!safe_folder_path(path)) return send_error(c, 400, "Bad Request", "unsafe or unsupported folder name");
+    int kind = storage_path_kind(path);
+    if (kind == STORAGE_KIND_ERROR) return send_error(c, 500, "Internal Server Error", storage_last_error());
+    if (kind != STORAGE_KIND_MISSING) return send_error(c, 409, "Conflict", "a file or folder with that name already exists");
+    if (!storage_mkdir(path)) return send_error(c, 500, "Internal Server Error", storage_last_error());
+    return send_response(c, 200, "OK", "text/plain", "OK MKDIR DONE\n");
+}
+
+// Entries removed per request when deleting a non-empty folder. The page
+// repeats the request until it reports DONE, so no single request blocks
+// the Pico (and WiFi) for long.
+#define M65_RMDIR_BATCH 32u
+
+static err_t remove_folder(http_conn_t *c, const char *path, bool recursive)
+{
+    if (!check_perm(c, REMOTE_AUTH_FILES)) return send_error(c, 403, "Forbidden", "folder changes are not authorised");
+    if (!check_write_grant()) return send_error(c, 423, "Locked", "write grant is not active");
+    if (!safe_folder_path(path)) return send_error(c, 400, "Bad Request", "unsafe or protected folder");
+    int kind = storage_path_kind(path);
+    if (kind == STORAGE_KIND_ERROR) return send_error(c, 500, "Internal Server Error", storage_last_error());
+    if (kind != STORAGE_KIND_DIR) return send_error(c, 404, "Not Found", "no such folder");
+
+    if (!recursive) {
+        int empty = storage_dir_is_empty(path);
+        if (empty < 0) return send_error(c, 500, "Internal Server Error", storage_last_error());
+        if (!empty) return send_error(c, 409, "Conflict", "folder is not empty");
+        if (!storage_delete(path)) return send_error(c, 500, "Internal Server Error", storage_last_error());
+        return send_response(c, 200, "OK", "text/plain", "OK RMDIR DONE\n");
+    }
+
+    int r = storage_delete_tree(path, M65_RMDIR_BATCH);
+    if (r < 0) return send_error(c, 500, "Internal Server Error", storage_last_error());
+    return send_response(c, 200, "OK", "text/plain", r ? "OK RMDIR DONE\n" : "OK RMDIR MORE\n");
 }
 
 static bool parse_query_value(const char *target, const char *key, char *out, size_t out_len)
@@ -3252,6 +3323,17 @@ static err_t parse_headers(http_conn_t *c)
                 return send_error(c, 400, "Bad Request", "missing file query parameter");
             }
             return delete_file(c, file);
+        }
+        if (ci_equal(target_path, "/mkdir") || ci_equal(target_path, "/rmdir")) {
+            char folder[256];
+            if (!parse_query_value(c->target, "path", folder, sizeof folder)) {
+                return send_error(c, 400, "Bad Request", "missing path query parameter");
+            }
+            if (ci_equal(target_path, "/mkdir")) return make_folder(c, folder);
+            char recursive[4];
+            bool all = parse_query_value(c->target, "recursive", recursive, sizeof recursive) &&
+                       strcmp(recursive, "1") == 0;
+            return remove_folder(c, folder, all);
         }
         return send_error(c, 404, "Not Found", "unknown PUT endpoint");
     }

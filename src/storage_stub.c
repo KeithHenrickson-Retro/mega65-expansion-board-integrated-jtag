@@ -21,6 +21,9 @@ void storage_close(storage_file_t *f) { if (f) f->impl = NULL; }
 bool storage_delete(const char *path) { (void)path; return false; }
 bool storage_rename(const char *old_path, const char *new_path) { (void)old_path; (void)new_path; return false; }
 bool storage_mkdir(const char *path) { (void)path; return false; }
+int storage_path_kind(const char *path) { (void)path; return STORAGE_KIND_ERROR; }
+int storage_dir_is_empty(const char *path) { (void)path; return -1; }
+int storage_delete_tree(const char *path, unsigned budget) { (void)path; (void)budget; return -1; }
 bool storage_list_cores(const char *path, storage_list_cb_t cb, void *ctx) { (void)path; (void)cb; (void)ctx; return false; }
 bool storage_list_dir(const char *path, storage_list_cb_t cb, void *ctx) { (void)path; (void)cb; (void)ctx; return false; }
 void storage_format_timestamp(const storage_timestamp_t *ts, char *out, size_t out_len) { (void)ts; if (out && out_len) snprintf(out, out_len, "-"); }

@@ -36,6 +36,7 @@ static bool file_pool_orphan[STORAGE_FILE_SLOTS];
 static char last_err[128];
 static bool mounted;
 static uint32_t mount_gen;          // bumped whenever the volume comes or goes
+static uint32_t change_gen;         // bumped whenever an entry is created, removed or renamed
 static bool removal_event_pending;  // card lost; not yet reported by hotplug poll
 
 static void card_lost(void);
@@ -106,7 +107,10 @@ static void cd_init(void)
 
 uint32_t storage_media_generation(void)
 {
-    return mount_gen;
+    // Changes on a card swap/remount *or* any change to the card's entries.
+    // mount_gen alone still guards open directory walks (see list below),
+    // which survive content changes but not a different volume.
+    return mount_gen + change_gen;
 }
 
 bool storage_sd_card_present(void)
@@ -335,6 +339,7 @@ bool storage_open_write(storage_file_t *f, const char *path, bool truncate)
         return false;
     }
     f->impl = slot;
+    change_gen++;   // file created or truncated
     return true;
 }
 
@@ -503,7 +508,107 @@ bool storage_delete(const char *path)
     if (!card_ok()) return false;
     FRESULT fr = f_unlink(path);
     if (fr != FR_OK && fr != FR_NO_FILE) { set_err("f_unlink", fr); return false; }
+    if (fr == FR_OK) change_gen++;
     return true;
+}
+
+// Shared scratch for the folder helpers below. They never nest or run
+// concurrently, and one long-filename FILINFO is ~280 bytes of scarce RAM.
+static DIR tree_dir;
+static FILINFO tree_fi;
+
+int storage_path_kind(const char *path)
+{
+    if (!path || !path[0]) return STORAGE_KIND_ERROR;
+    if (!card_ok()) return STORAGE_KIND_ERROR;
+    FILINFO *fi = &tree_fi;
+    FRESULT fr = f_stat(path, fi);
+    if (fr == FR_NO_FILE || fr == FR_NO_PATH) return STORAGE_KIND_MISSING;
+    if (fr != FR_OK) { set_err("f_stat", fr); return STORAGE_KIND_ERROR; }
+    return (fi->fattrib & AM_DIR) ? STORAGE_KIND_DIR : STORAGE_KIND_FILE;
+}
+
+int storage_dir_is_empty(const char *path)
+{
+    if (!path || !path[0]) return -1;
+    if (!card_ok()) return -1;
+    FRESULT fr = f_opendir(&tree_dir, path);
+    if (fr != FR_OK) { set_err("f_opendir", fr); return -1; }
+    fr = f_readdir(&tree_dir, &tree_fi);   // FatFs never returns "." or ".."
+    f_closedir(&tree_dir);
+    if (fr != FR_OK) { set_err("f_readdir", fr); return -1; }
+    return tree_fi.fname[0] == 0 ? 1 : 0;
+}
+
+// Iterative and allocation-free: one DIR, one FILINFO and one path buffer,
+// whatever the depth. Each step reopens the current folder and takes its
+// first entry: a file is deleted, a folder is descended into, and an empty
+// folder is deleted and left. Re-reading from the top is O(n^2) in entries
+// per folder, which is fine for core collections and keeps RAM flat.
+int storage_delete_tree(const char *path, unsigned budget)
+{
+    static char cur[256];
+    DIR *d = &tree_dir;
+    FILINFO *fi = &tree_fi;
+
+    if (!path || !path[0] || strcmp(path, "/") == 0) {
+        snprintf(last_err, sizeof(last_err), "refusing to delete the root folder");
+        return -1;
+    }
+    size_t base_len = strlen(path);
+    if (base_len >= sizeof cur) {
+        snprintf(last_err, sizeof(last_err), "path too long");
+        return -1;
+    }
+    memcpy(cur, path, base_len + 1u);
+
+    while (budget) {
+        if (!card_ok()) return -1;
+        FRESULT fr = f_opendir(d, cur);
+        if (fr != FR_OK) { set_err("f_opendir", fr); return -1; }
+        fr = f_readdir(d, fi);
+        f_closedir(d);
+        if (fr != FR_OK) { set_err("f_readdir", fr); return -1; }
+
+        size_t n = strlen(cur);
+        if (fi->fname[0] == 0) {
+            // Current folder is empty: remove it and step back up
+            fr = f_unlink(cur);
+            if (fr != FR_OK) { set_err("f_unlink", fr); return -1; }
+            change_gen++;
+            budget--;
+            if (n <= base_len) return 1;          // that was the target itself
+            char *slash = strrchr(cur, '/');
+            if (!slash) return 1;
+            *slash = 0;
+            continue;
+        }
+
+        size_t name_len = strlen(fi->fname);
+        if (n + 1u + name_len >= sizeof cur) {
+            snprintf(last_err, sizeof(last_err), "path too long inside %.80s", cur);
+            return -1;
+        }
+        cur[n] = '/';
+        memcpy(cur + n + 1u, fi->fname, name_len + 1u);
+
+        if (fi->fattrib & AM_DIR) continue;         // descend; removed once empty
+
+        fr = f_unlink(cur);
+        if (fr != FR_OK) {
+            // e.g. FR_DENIED for a read-only file: say which one
+            char err_path[64];
+            snprintf(err_path, sizeof err_path, "%s", cur);
+            set_err("f_unlink", fr);
+            size_t el = strlen(last_err);
+            snprintf(last_err + el, sizeof(last_err) - el, " (%s)", err_path);
+            return -1;
+        }
+        cur[n] = 0;
+        change_gen++;
+        budget--;
+    }
+    return 0;   // more remain; call again
 }
 
 bool storage_rename(const char *old_path, const char *new_path)
@@ -512,6 +617,7 @@ bool storage_rename(const char *old_path, const char *new_path)
     if (!card_ok()) return false;
     FRESULT fr = f_rename(old_path, new_path);
     if (fr != FR_OK) { set_err("f_rename", fr); return false; }
+    change_gen++;
     return true;
 }
 
@@ -521,6 +627,7 @@ bool storage_mkdir(const char *path)
     if (!card_ok()) return false;
     FRESULT fr = f_mkdir(path);
     if (fr != FR_OK && fr != FR_EXIST) { set_err("f_mkdir", fr); return false; }
+    if (fr == FR_OK) change_gen++;
     return true;
 }
 
