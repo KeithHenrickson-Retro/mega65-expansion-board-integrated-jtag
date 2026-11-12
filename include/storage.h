@@ -63,8 +63,18 @@ int storage_dir_is_empty(const char *path);
 // `budget` entries per call so no single call blocks for long.
 // Returns 1 = finished, 0 = more remain (call again), -1 = error.
 int storage_delete_tree(const char *path, unsigned budget);
-list_result_t storage_list_cores(const char *path, storage_list_cb_t cb, void *ctx, bool listing_continues);
-list_result_t storage_list_dir(const char *path, storage_list_cb_t cb, void *ctx, bool listing_continues);
+// One-shot listings: each call opens, walks and closes its own directory
+// handle, so listings can nest (callbacks may list subfolders) and can never
+// disturb each other or the resumable listing below. A callback returning
+// false stops the walk (lrFull).
+list_result_t storage_list_cores(const char *path, storage_list_cb_t cb, void *ctx);
+list_result_t storage_list_dir(const char *path, storage_list_cb_t cb, void *ctx);
+// The one resumable listing (chunked AT+CORELIST / AT+COREDETAIL output): it
+// keeps its own handle open between calls while the callback returns false
+// (lrFull), and listing_continues=true carries on from there. Starting a new
+// one (listing_continues=false) abandons any unfinished one.
+list_result_t storage_list_cores_resumable(const char *path, storage_list_cb_t cb, void *ctx, bool listing_continues);
+void storage_list_resumable_abort(void);
 void storage_format_timestamp(const storage_timestamp_t *ts, char *out, size_t out_len);
 
 typedef enum {

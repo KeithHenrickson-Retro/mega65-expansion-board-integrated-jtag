@@ -631,29 +631,17 @@ bool storage_mkdir(const char *path)
     return true;
 }
 
-static list_result_t storage_list_filtered(const char *path, storage_list_cb_t cb, void *ctx, bool cores_only, bool listing_continues)
+// Walks an open directory, calling cb for each entry that passes the filter.
+// Closes the directory when the walk ends or fails; leaves it open when the
+// callback stops it (lrFull) so a resumable listing can carry on later.
+static list_result_t list_walk(DIR *dir, const char *p, storage_list_cb_t cb, void *ctx, bool cores_only)
 {
-    static DIR dir;
-    static uint32_t dir_gen;
     FILINFO fi;
-    const char *p = (path && path[0]) ? path : "/";
-    if (!card_ok()) return lrFailed;
-    if (!listing_continues) {
-        FRESULT fr = f_opendir(&dir, p);
-        if (fr != FR_OK) { set_err("f_opendir", fr); return lrFailed; }
-        dir_gen = mount_gen;
-    } else if (dir_gen != mount_gen) {
-        // The volume this listing was walking is gone (card swapped/remounted).
-        snprintf(last_err, sizeof(last_err), "sd card removed");
-        return lrFailed;
-    }
-
     bool in_theme_dir = ext_equal_ci_local(p, M65_THEME_DIR_PATH) ||
                         (p[0] == '/' && ext_equal_ci_local(p + 1, M65_THEME_DIR_PATH));
-
     for (;;) {
-        FRESULT fr = f_readdir(&dir, &fi);
-        if (fr != FR_OK) { set_err("f_readdir", fr); f_closedir(&dir); return lrFailed; }
+        FRESULT fr = f_readdir(dir, &fi);
+        if (fr != FR_OK) { set_err("f_readdir", fr); f_closedir(dir); return lrFailed; }
         if (fi.fname[0] == 0) break;
         bool is_dir = (fi.fattrib & AM_DIR) != 0;
         if (!cores_only || is_dir || has_core_ext(fi.fname) ||
@@ -663,19 +651,69 @@ static list_result_t storage_list_filtered(const char *path, storage_list_cb_t c
             if (!cb(fi.fname, (uint32_t)fi.fsize, is_dir, &modified, ctx)) {
                 return lrFull;
             }
-
         }
     }
-    f_closedir(&dir);
+    f_closedir(dir);
     return lrSuccess;
 }
 
-list_result_t storage_list_cores(const char *path, storage_list_cb_t cb, void *ctx, bool listing_continues)
+static list_result_t list_once(const char *path, storage_list_cb_t cb, void *ctx, bool cores_only)
 {
-    return storage_list_filtered(path, cb, ctx, true, listing_continues);
+    DIR dir;
+    const char *p = (path && path[0]) ? path : "/";
+    if (!card_ok()) return lrFailed;
+    FRESULT fr = f_opendir(&dir, p);
+    if (fr != FR_OK) { set_err("f_opendir", fr); return lrFailed; }
+    list_result_t r = list_walk(&dir, p, cb, ctx, cores_only);
+    if (r == lrFull) f_closedir(&dir);   // stopped early: nothing will resume it
+    return r;
 }
 
-list_result_t storage_list_dir(const char *path, storage_list_cb_t cb, void *ctx, bool listing_continues)
+list_result_t storage_list_cores(const char *path, storage_list_cb_t cb, void *ctx)
 {
-    return storage_list_filtered(path, cb, ctx, false, listing_continues);
+    return list_once(path, cb, ctx, true);
+}
+
+list_result_t storage_list_dir(const char *path, storage_list_cb_t cb, void *ctx)
+{
+    return list_once(path, cb, ctx, false);
+}
+
+static DIR resumable_dir;
+static bool resumable_open;
+static uint32_t resumable_gen;
+static char resumable_path[256];
+
+void storage_list_resumable_abort(void)
+{
+    if (resumable_open) f_closedir(&resumable_dir);
+    resumable_open = false;
+}
+
+list_result_t storage_list_cores_resumable(const char *path, storage_list_cb_t cb, void *ctx, bool listing_continues)
+{
+    const char *p = (path && path[0]) ? path : "/";
+    if (!listing_continues) {
+        storage_list_resumable_abort();
+        if (!card_ok()) return lrFailed;
+        FRESULT fr = f_opendir(&resumable_dir, p);
+        if (fr != FR_OK) { set_err("f_opendir", fr); return lrFailed; }
+        resumable_open = true;
+        resumable_gen = mount_gen;
+        snprintf(resumable_path, sizeof resumable_path, "%s", p);
+    } else {
+        if (!resumable_open) {
+            snprintf(last_err, sizeof(last_err), "no listing in progress");
+            return lrFailed;
+        }
+        if (!card_ok() || resumable_gen != mount_gen) {
+            // The volume this listing was walking is gone (card swapped/remounted).
+            resumable_open = false;
+            snprintf(last_err, sizeof(last_err), "sd card removed");
+            return lrFailed;
+        }
+    }
+    list_result_t r = list_walk(&resumable_dir, resumable_path, cb, ctx, true);
+    if (r != lrFull) resumable_open = false;   // walked to the end, or failed: closed
+    return r;
 }

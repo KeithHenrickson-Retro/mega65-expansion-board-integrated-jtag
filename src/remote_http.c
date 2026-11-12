@@ -17,6 +17,7 @@
 #include "storage.h"
 #include "uart_cmd.h"
 #include "write_gate.h"
+#include "www_assets.h"
 
 #include "mbedtls/sha256.h"
 
@@ -224,6 +225,7 @@ typedef struct {
     uint32_t expected_idcode;
     uint32_t file_offset;
     uint32_t file_size;
+    const uint8_t *mem_data;   // HTTP_SEND_FILE from memory (built-in WWW file) instead of SD
     jtag_stream_writer_t jtag;
     signed_file_rx_t signed_rx;
 } http_conn_t;
@@ -664,6 +666,23 @@ static const char default_busy[] =
 
 static bool ext_equal_ci(const char *a, const char *b);
 static bool ci_equal(const char *a, const char *b);
+
+// Built-in copy of a WWW/ file (tools/embed_www.py), or NULL
+static const m65_www_asset_t *www_builtin(const char *name)
+{
+    for (unsigned i = 0; name && i < m65_www_asset_count; i++) {
+        if (ci_equal(m65_www_assets[i].name, name)) return &m65_www_assets[i];
+    }
+    return NULL;
+}
+
+// Template to use when the card has none: the built-in copy of the default
+// web interface file, or the minimal text template if even that is missing
+static const char *www_builtin_text(const char *name, const char *minimal)
+{
+    const m65_www_asset_t *a = www_builtin(name);
+    return a ? (const char *)a->data : minimal;
+}
 
 static bool has_core_ext(const char *name)
 {
@@ -1559,7 +1578,7 @@ static void load_cached_web_assets(void)
     busy_template_loaded = load_template("WWW/fetch_busy.html",
                                          busy_template,
                                          sizeof busy_template,
-                                         default_busy);
+                                         www_builtin_text("fetch_busy.html", default_busy));
     favicon_cache_loaded = load_binary_asset("WWW/favicon-32x32.png",
                                              favicon_cache,
                                              sizeof favicon_cache,
@@ -1693,6 +1712,26 @@ static bool pending_firmware_version_is_current(void)
            ci_equal(pending_firmware_version, M65_VERSION_STRING);
 }
 
+// Build markers are YYYY-MM-DD-<minutes since midnight>-<commit>. Offer a
+// package only when it is newer than what is running: after a USB install of
+// a later build, an older package left in DOWNLOADS/ must not be offered as
+// an "update". Markers that do not parse fall back to "different".
+static bool build_marker_key(const char *m, uint64_t *key)
+{
+    unsigned y, mo, d, min;
+    if (!m || sscanf(m, "%4u-%2u-%2u-%u", &y, &mo, &d, &min) != 4) return false;
+    if (mo < 1 || mo > 12 || d < 1 || d > 31 || min >= 1440) return false;
+    *key = (((uint64_t)y * 12u + (mo - 1u)) * 31u + (d - 1u)) * 1440u + min;
+    return true;
+}
+
+static bool firmware_build_is_newer(const char *pending, const char *current)
+{
+    uint64_t kp, kc;
+    if (build_marker_key(pending, &kp) && build_marker_key(current, &kc)) return kp > kc;
+    return strcmp(pending, current) != 0;
+}
+
 bool firmware_update_available(void)
 {
     if (!storage_file_exists(M65_FIRMWARE_PACKAGE_PATH)) {
@@ -1706,7 +1745,7 @@ bool firmware_update_available(void)
                                pending_firmware_source, sizeof pending_firmware_source);
         pending_firmware_seen = pending_firmware_version[0] || pending_firmware_build[0] || pending_firmware_source[0];
     }
-    if (pending_firmware_build[0]) return strcmp(pending_firmware_build, M65_BUILD_MARKER) != 0;
+    if (pending_firmware_build[0]) return firmware_build_is_newer(pending_firmware_build, M65_BUILD_MARKER);
     if (pending_firmware_version[0]) return !pending_firmware_version_is_current();
     return true;
 }
@@ -1730,7 +1769,7 @@ static bool theme_scan_cb(const char *name, uint32_t size, bool is_dir, const st
 static uint32_t theme_scan(theme_scan_ctx_t *out)
 {
     theme_scan_ctx_t ts = {0};
-    (void)storage_list_dir(M65_THEME_DIR_PATH, theme_scan_cb, &ts, false);
+    (void)storage_list_dir(M65_THEME_DIR_PATH, theme_scan_cb, &ts);
     if (out) *out = ts;
     return ts.count;
 }
@@ -2297,6 +2336,11 @@ static bool index_cb(const char *name, uint32_t size, bool is_dir, const storage
         return true;
     }
     if (is_dir && ci_equal(name, "WWW")) return true;
+    // Firmware update packages and fetch slots: nothing to launch or manage here
+    if (is_dir && ci_equal(name, "DOWNLOADS") &&
+        (!il->dir_path || !il->dir_path[0] || strcmp(il->dir_path, "/") == 0)) {
+        return true;
+    }
     if (il->rows >= M65_HTTP_INDEX_MAX_ROWS) {
         il->truncated = true;
         return true;
@@ -2450,7 +2494,7 @@ static err_t send_busy_page(http_conn_t *c)
     page_builder_t pb = { .buf = page_buf, .cap = M65_HTTP_BUSY_PAGE_MAX };
     page_buf[0] = 0;
     append_substituted(&pb,
-                       busy_template_loaded ? busy_template : default_busy,
+                       busy_template_loaded ? busy_template : www_builtin_text("fetch_busy.html", default_busy),
                        NULL,
                        NULL,
                        "/",
@@ -2779,7 +2823,8 @@ static err_t send_index(http_conn_t *c, uint8_t board_rev)
         return send_error(c, 400, "Bad Request", "unsafe index path");
     }
 
-    load_template("WWW/index_row.html", row_template, sizeof row_template, default_row);
+    load_template("WWW/index_row.html", row_template, sizeof row_template,
+                  www_builtin_text("index_row.html", default_row));
 
     char *page_buf = (char *)malloc(M65_HTTP_PAGE_MAX);
     if (!page_buf) {
@@ -2792,7 +2837,8 @@ static err_t send_index(http_conn_t *c, uint8_t board_rev)
     if (storage_sd_card_present() && !storage_is_mounted()) (void)storage_mount();
     // Sample before reading the card so a change mid-build still shows the banner.
     uint32_t gen_at_listing = storage_media_generation();
-    append_template_or_fallback(&pb, "WWW/index_top.html", default_top, NULL, NULL, dir_path, 0, false, NULL, board_rev);
+    append_template_or_fallback(&pb, "WWW/index_top.html", www_builtin_text("index_top.html", default_top),
+                                NULL, NULL, dir_path, 0, false, NULL, board_rev);
 
     index_list_ctx_t il = {
         .pb = &pb,
@@ -2800,13 +2846,14 @@ static err_t send_index(http_conn_t *c, uint8_t board_rev)
         .dir_path = dir_path,
         .board_rev = board_rev,
     };
-    if (!storage_is_mounted() || !storage_list_cores(dir_path, index_cb, &il, false)) {
+    if (!storage_is_mounted() || !storage_list_cores(dir_path, index_cb, &il)) {
         index_append_sd_problem(&pb, dir_path);
     }
     if (il.truncated) {
         page_append(&pb, "<tr><td colspan=\"4\">List truncated</td></tr>\n");
     }
-    append_template_or_fallback(&pb, "WWW/index_bottom.html", default_bottom, NULL, NULL, dir_path, 0, false, NULL, board_rev);
+    append_template_or_fallback(&pb, "WWW/index_bottom.html", www_builtin_text("index_bottom.html", default_bottom),
+                                NULL, NULL, dir_path, 0, false, NULL, board_rev);
     static char sd_watch[sizeof sd_watch_script_fmt + 16];   // static: too big for the 2 KB stack
     snprintf(sd_watch, sizeof sd_watch, sd_watch_script_fmt,
              (unsigned long)gen_at_listing, (unsigned long)m65_boot_id());
@@ -2826,6 +2873,15 @@ static err_t send_file_chunk(http_conn_t *c)
     size_t want = c->file_size - c->file_offset;
     if (want > M65_HTTP_IO_CHUNK) want = M65_HTTP_IO_CHUNK;
     if (want > snd) want = snd;
+
+    if (c->mem_data) {
+        err_t err = tcp_write(c->pcb, c->mem_data + c->file_offset, (u16_t)want, TCP_WRITE_FLAG_COPY);
+        if (err != ERR_OK) return ERR_OK;
+        c->file_offset += (uint32_t)want;
+        tcp_output(c->pcb);
+        if (c->file_offset >= c->file_size) return http_close(c);
+        return ERR_OK;
+    }
 
     static uint8_t io[M65_HTTP_IO_CHUNK];
     storage_file_t f = {0};
@@ -2898,7 +2954,27 @@ static err_t start_www_download(http_conn_t *c, const char *path)
     if (snprintf(full, sizeof full, "WWW/%s", path) >= (int)sizeof full) {
         return send_error(c, 400, "Bad Request", "path too long");
     }
-    return start_download(c, full, content_type_for_path(full), false);
+    if (storage_file_exists(full)) return start_download(c, full, content_type_for_path(full), false);
+
+    // Not on the card (no card, no WWW/, or a partial theme): the built-in copy
+    const m65_www_asset_t *a = www_builtin(path);
+    if (!a) return send_error(c, 404, "Not Found", "no such WWW file");
+    snprintf(c->content_type, sizeof c->content_type, "%s", content_type_for_path(full));
+    c->mem_data = a->data;
+    c->attachment = false;
+    c->file_size = a->size;
+    c->file_offset = 0;
+    c->state = HTTP_SEND_FILE;
+    char header[200];
+    snprintf(header, sizeof header,
+             "HTTP/1.0 200 OK\r\n"
+             "Connection: close\r\n"
+             "Content-Type: %s\r\n"
+             "Content-Length: %lu\r\n"
+             "\r\n",
+             c->content_type, (unsigned long)a->size);
+    if (!tcp_write_copy(c, header, strlen(header))) return http_close(c);
+    return send_file_chunk(c);
 }
 
 static err_t start_downloads_download(http_conn_t *c, const char *path)
@@ -4364,11 +4440,16 @@ void remote_http_autofetch_reset_schedule(void)
 }
 
 typedef struct {
-    const char *dir;
     uint32_t deleted;
+    uint8_t depth;
 } partial_cleanup_ctx_t;
 
-static void delete_partial_tree(const char *dir, uint32_t *deleted);
+// Each level costs a FatFs DIR and long-filename FILINFO on the 2 KB stack
+#define M65_PARTIAL_CLEANUP_MAX_DEPTH 4u
+// Folder being cleaned: "" is the root. Grown on the way down, cut back after.
+static char partial_path[256];
+
+static void delete_partial_level(partial_cleanup_ctx_t *pc);
 
 static bool delete_partial_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
@@ -4377,23 +4458,39 @@ static bool delete_partial_cb(const char *name, uint32_t size, bool is_dir, cons
     partial_cleanup_ctx_t *pc = (partial_cleanup_ctx_t *)ctx;
     if (!pc || !name || !name[0]) return true;
 
-    char path[256];
-    if (!make_child_path(pc->dir, name, path, sizeof path)) return true;
-    if (is_dir) {
-        if (!ci_equal(name, "WWW")) delete_partial_tree(path, &pc->deleted);
+    size_t len = strlen(partial_path);
+    int n = snprintf(partial_path + len, sizeof partial_path - len, "%s%s", len ? "/" : "", name);
+    if (n < 0 || (size_t)n >= sizeof partial_path - len) {
+        partial_path[len] = 0;   // too deep a name: skip it
         return true;
     }
-    if (is_partial_core_path(path) && storage_delete(path)) pc->deleted++;
+    if (is_dir) {
+        if (!ci_equal(name, "WWW") && pc->depth < M65_PARTIAL_CLEANUP_MAX_DEPTH) {
+            pc->depth++;
+            delete_partial_level(pc);
+            pc->depth--;
+        }
+    } else if (is_partial_core_path(partial_path) && storage_delete(partial_path)) {
+        pc->deleted++;
+    }
+    partial_path[len] = 0;
     return true;
+}
+
+static void delete_partial_level(partial_cleanup_ctx_t *pc)
+{
+    storage_list_cores(partial_path[0] ? partial_path : "/", delete_partial_cb, pc);
 }
 
 static void delete_partial_tree(const char *dir, uint32_t *deleted)
 {
+    snprintf(partial_path, sizeof partial_path, "%s",
+             (dir && dir[0] && strcmp(dir, "/") != 0) ? dir : "");
     partial_cleanup_ctx_t ctx = {
-        .dir = (dir && dir[0]) ? dir : "/",
         .deleted = deleted ? *deleted : 0,
+        .depth = 0,
     };
-    storage_list_cores(ctx.dir, delete_partial_cb, &ctx, false);
+    delete_partial_level(&ctx);
     if (deleted) *deleted = ctx.deleted;
 }
 
@@ -5201,47 +5298,21 @@ const char *remote_http_firmware_status(void)
 
 
 
-typedef struct {
-    const char *dir;
-    bool ok;
-} delete_tree_ctx_t;
-
-static void delete_tree(const char *dir, bool delete_self, bool *ok);
-
-static bool delete_tree_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
-{
-    (void)size;
-    (void)modified;
-    delete_tree_ctx_t *dt = (delete_tree_ctx_t *)ctx;
-    if (!dt || !dt->ok || !name || !name[0]) return true;
-
-    char path[256];
-    if (!make_child_path(dt->dir, name, path, sizeof path)) {
-        dt->ok = false;
-        return true;
-    }
-    if (is_dir) {
-        delete_tree(path, true, &dt->ok);
-    } else if (!storage_delete(path)) {
-        dt->ok = false;
-    }
-    return true;
-}
-
+// Deletes everything inside dir, and dir itself if delete_self. Uses
+// storage_delete_tree(): iterative, fixed RAM, whatever the depth. (It used
+// to recurse through nested listings with a 256-byte path per level.)
 static void delete_tree(const char *dir, bool delete_self, bool *ok)
 {
     if (ok && !*ok) return;
-    delete_tree_ctx_t ctx = {
-        .dir = (dir && dir[0]) ? dir : "/",
-        .ok = true,
-    };
-    if (!storage_list_dir(ctx.dir, delete_tree_cb, &ctx, false)) {
-        ctx.ok = false;
-    }
-    if (ctx.ok && delete_self && !storage_delete(ctx.dir)) {
-        ctx.ok = false;
-    }
-    if (ok) *ok = ctx.ok;
+    const char *d = (dir && dir[0]) ? dir : "/";
+    bool good = true;
+    int r;
+    do {
+        r = storage_delete_tree(d, 64u);
+    } while (r == 0);
+    if (r < 0) good = false;
+    else if (!delete_self && !storage_mkdir(d)) good = false;   // keep the (now empty) folder
+    if (ok) *ok = good;
 }
 
 static bool tar_zero_block(const uint8_t block[512])
@@ -5501,31 +5572,132 @@ bool remote_http_theme_install_named(const char *theme_name, char *err, size_t e
     return true;
 }
 
+// The server handles one request at a time. A connection that arrives while
+// it is busy is parked rather than aborted: accepted, but its data left with
+// lwIP (the receive callback refuses it, so lwIP holds it and redelivers it
+// later) until the current request finishes. Browsers fetch a page's
+// stylesheet, script and images in parallel; aborting those made parts of
+// the page fail at random. A parked connection costs no RAM beyond the
+// lwIP PCB it already has; the queue is bounded and old entries time out.
+#define HTTP_PARK_SLOTS       4u
+#define HTTP_PARK_TIMEOUT_MS  15000u
+
+typedef struct {
+    struct tcp_pcb *pcb;
+    uint32_t since_ms;
+    uint32_t seq;
+} http_park_slot_t;
+
+static http_park_slot_t http_park[HTTP_PARK_SLOTS];
+static uint32_t http_park_seq;
+
+static void http_conn_attach(struct tcp_pcb *pcb)
+{
+    memset(&http_conn, 0, sizeof http_conn);
+    http_conn.pcb = pcb;
+    http_conn.in_use = true;
+    http_conn.state = HTTP_RECV_HEADERS;
+    http_conn.remote_ip = lwip_ip_to_host_u32(&pcb->remote_ip);
+
+    tcp_arg(pcb, &http_conn);
+    tcp_recv(pcb, http_recv);
+    tcp_sent(pcb, http_sent);
+    tcp_err(pcb, http_err);
+    tcp_poll(pcb, http_poll_cb, 2);
+}
+
+static void http_park_err(void *arg, err_t err)
+{
+    (void)err;
+    http_park_slot_t *slot = (http_park_slot_t *)arg;
+    if (slot) slot->pcb = NULL;   // lwIP has already freed the PCB
+}
+
+static err_t http_park_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
+{
+    (void)err;
+    http_park_slot_t *slot = (http_park_slot_t *)arg;
+    if (!p) {
+        // Client gave up before being served
+        if (slot) slot->pcb = NULL;
+        tcp_arg(pcb, NULL);
+        tcp_recv(pcb, NULL);
+        tcp_err(pcb, NULL);
+        if (tcp_close(pcb) != ERR_OK) {
+            tcp_abort(pcb);
+            return ERR_ABRT;
+        }
+        return ERR_OK;
+    }
+    return ERR_MEM;   // not yet: lwIP keeps the data and offers it again
+}
+
+static void http_park_drop(http_park_slot_t *slot)
+{
+    struct tcp_pcb *pcb = slot->pcb;
+    slot->pcb = NULL;
+    if (!pcb) return;
+    tcp_arg(pcb, NULL);
+    tcp_recv(pcb, NULL);
+    tcp_err(pcb, NULL);
+    tcp_abort(pcb);
+}
+
+// Main loop: serve the longest-waiting parked connection once the server is
+// free, and drop any that waited too long
+static void http_park_service(void)
+{
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+    http_park_slot_t *next = NULL;
+    for (unsigned i = 0; i < HTTP_PARK_SLOTS; i++) {
+        http_park_slot_t *slot = &http_park[i];
+        if (!slot->pcb) continue;
+        if (now - slot->since_ms > HTTP_PARK_TIMEOUT_MS) {
+            http_park_drop(slot);
+            continue;
+        }
+        if (!next || slot->seq < next->seq) next = slot;
+    }
+    if (!next || http_conn.in_use) return;
+    struct tcp_pcb *pcb = next->pcb;
+    next->pcb = NULL;
+    http_conn_attach(pcb);
+    if (pcb->refused_data) tcp_process_refused_data(pcb);   // the request it already sent
+}
+
+static void http_park_drop_all(void)
+{
+    for (unsigned i = 0; i < HTTP_PARK_SLOTS; i++) http_park_drop(&http_park[i]);
+}
+
 static err_t http_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 {
     (void)arg;
     if (err != ERR_OK || !newpcb) return ERR_VAL;
     if (http_conn.in_use) {
-        tcp_abort(newpcb);
+        for (unsigned i = 0; i < HTTP_PARK_SLOTS; i++) {
+            http_park_slot_t *slot = &http_park[i];
+            if (slot->pcb) continue;
+            slot->pcb = newpcb;
+            slot->since_ms = to_ms_since_boot(get_absolute_time());
+            slot->seq = ++http_park_seq;
+            tcp_arg(newpcb, slot);
+            tcp_recv(newpcb, http_park_recv);
+            tcp_err(newpcb, http_park_err);
+            tcp_sent(newpcb, NULL);
+            tcp_poll(newpcb, NULL, 0);
+            return ERR_OK;
+        }
+        tcp_abort(newpcb);   // queue full
         return ERR_ABRT;
     }
-
-    memset(&http_conn, 0, sizeof http_conn);
-    http_conn.pcb = newpcb;
-    http_conn.in_use = true;
-    http_conn.state = HTTP_RECV_HEADERS;
-    http_conn.remote_ip = lwip_ip_to_host_u32(&newpcb->remote_ip);
-
-    tcp_arg(newpcb, &http_conn);
-    tcp_recv(newpcb, http_recv);
-    tcp_sent(newpcb, http_sent);
-    tcp_err(newpcb, http_err);
-    tcp_poll(newpcb, http_poll_cb, 2);
+    http_conn_attach(newpcb);
     return ERR_OK;
 }
 
 static void close_http_listener(void)
 {
+    http_park_drop_all();
     if (!listen_pcb) return;
     tcp_accept(listen_pcb, NULL);
     if (tcp_close(listen_pcb) == ERR_OK) listen_pcb = NULL;
@@ -5542,7 +5714,7 @@ static bool listen_http(uint16_t port)
         listen_pcb = NULL;
         return false;
     }
-    listen_pcb = tcp_listen_with_backlog(listen_pcb, 1);
+    listen_pcb = tcp_listen_with_backlog(listen_pcb, HTTP_PARK_SLOTS + 1u);
     if (!listen_pcb) return false;
     tcp_accept(listen_pcb, http_accept);
     return true;
@@ -5881,6 +6053,7 @@ void remote_http_init(void)
 void remote_http_poll(void)
 {
     remote_log_wifi_change();
+    if (http_is_active) http_park_service();
     absolute_time_t now = get_absolute_time();
     if (wifi_probe_retry_scheduled && absolute_time_diff_us(now, wifi_probe_retry_at) <= 0) {
         wifi_probe_retry_scheduled = false;

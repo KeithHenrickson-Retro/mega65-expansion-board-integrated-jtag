@@ -483,6 +483,14 @@ Fetched theme packages are stored under `THEMES/`. In the device web UI,
 `THEMES/` is shown as a normal directory; clicking a `.m65jtheme` or `.tar`
 package verifies it and installs it into `WWW/`, subject to the write grant.
 
+The firmware also carries a built-in copy of the default `sdcard/WWW/` files,
+embedded at build time by `tools/embed_www.py`. Any `WWW/` file missing from
+the card (or a missing card) is served from that copy, so the full web
+interface (upload, drag and drop, folders) works on a blank card; files on the
+card, such as an installed theme, take precedence. `DOWNLOADS/`, `WWW/` and
+`THEMES/` are hidden from the MEGA65-side core list (`AT+CORELIST`), and
+`DOWNLOADS/` and `WWW/` from the web root listing.
+
 `check` prints `[blessed]`, `[uncursed]`, or `[cursed]` for local files. A
 blessed file has a valid trailer according to the local keys, `--trusted-key`,
 or `--remote-config mega65-jtag.cfg`; uncursed means no trailer, and cursed

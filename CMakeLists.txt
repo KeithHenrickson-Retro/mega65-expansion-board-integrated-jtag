@@ -144,6 +144,28 @@ if(M65_ENABLE_WIFI_REMOTE)
     endif()
     target_compile_definitions(pico_m65jtag PRIVATE M65_WIFI_SUPPORTED=1)
     target_link_libraries(pico_m65jtag pico_cyw43_arch_lwip_poll)
+
+    # Built-in copy of the default web interface, served when the SD card has
+    # no WWW/ files, so the full interface works on any card.
+    set(M65_WWW_EMBED_FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/sdcard/WWW/app.js
+        ${CMAKE_CURRENT_SOURCE_DIR}/sdcard/WWW/style.css
+        ${CMAKE_CURRENT_SOURCE_DIR}/sdcard/WWW/index_top.html
+        ${CMAKE_CURRENT_SOURCE_DIR}/sdcard/WWW/index_row.html
+        ${CMAKE_CURRENT_SOURCE_DIR}/sdcard/WWW/index_bottom.html
+        ${CMAKE_CURRENT_SOURCE_DIR}/sdcard/WWW/fetch_busy.html
+        ${CMAKE_CURRENT_SOURCE_DIR}/sdcard/WWW/mega65_320x64.png
+    )
+    set(M65_WWW_EMBED_C ${CMAKE_CURRENT_BINARY_DIR}/generated/www_assets.c)
+    add_custom_command(
+        OUTPUT ${M65_WWW_EMBED_C}
+        COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_www.py
+                --output ${M65_WWW_EMBED_C} ${M65_WWW_EMBED_FILES}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_www.py ${M65_WWW_EMBED_FILES}
+        COMMENT "Embedding default web interface (sdcard/WWW)"
+        VERBATIM
+    )
+    target_sources(pico_m65jtag PRIVATE ${M65_WWW_EMBED_C})
 else()
     target_compile_definitions(pico_m65jtag PRIVATE M65_WIFI_SUPPORTED=0)
 endif()
