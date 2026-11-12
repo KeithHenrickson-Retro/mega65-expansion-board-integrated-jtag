@@ -284,11 +284,15 @@ mirror: factory $(if $(filter $(UNIVERSAL_UF2),$(MIRROR_FIRMWARE_UNIVERSAL)),uni
 	mkdir -p "$(MIRROR_DIR)/WWW" "$(dir $(MIRROR_THEME))"; \
 	echo "Copying default SD web assets into $(MIRROR_DIR)/WWW"; \
 	for asset in $(WWW_THEME_FILES); do \
-		cp "sdcard/WWW/$$asset" "$(MIRROR_DIR)/WWW/$$asset"; \
+		if [ -f "sdcard/WWW/$$asset" ]; then \
+			cp "sdcard/WWW/$$asset" "$(MIRROR_DIR)/WWW/$$asset"; \
+		else \
+			echo "WARNING: sdcard/WWW/$$asset not found; leaving it out of the mirror"; \
+		fi; \
 	done; \
 	cp sdcard/mega65-jtag.cfg "$(MIRROR_DIR)/mega65-jtag.cfg.example"; \
 	echo "Packing default WWW theme: $(MIRROR_THEME)"; \
-	tar -cf "$(MIRROR_THEME)" -C sdcard/WWW $(WWW_THEME_FILES); \
+	tar -cf "$(MIRROR_THEME)" -C sdcard/WWW $(notdir $(wildcard $(addprefix sdcard/WWW/,$(WWW_THEME_FILES)))); \
 	build_marker="$$(sed -n 's/^#define M65_BUILD_MARKER "\(.*\)"/\1/p' "$(MIRROR_BUILD_MARKER_FILE)")"; \
 	if [ -z "$$build_marker" ]; then \
 		echo "ERROR: could not read M65_BUILD_MARKER from $(MIRROR_BUILD_MARKER_FILE)"; \
