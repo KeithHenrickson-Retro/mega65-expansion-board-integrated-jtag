@@ -17,11 +17,19 @@ set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
 
-execute_process(
-    COMMAND bash -c "printf '%s-%d' \"$(date +%Y-%m-%d)\" $((10#$(date +%H)*60 + 10#$(date +%M)))"
-    OUTPUT_VARIABLE M65_BUILD_TIME
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-)
+# M65_BUILD_TIME_OVERRIDE lets several builds share one build marker; the
+# universal UF2 needs its RP2040 and RP2350 halves to report the same build.
+# The Makefile passes it on every configure (empty normally), so a value from
+# an earlier universal build never lingers in the cache.
+if(M65_BUILD_TIME_OVERRIDE)
+    set(M65_BUILD_TIME "${M65_BUILD_TIME_OVERRIDE}")
+else()
+    execute_process(
+        COMMAND bash -c "printf '%s-%d' \"$(date +%Y-%m-%d)\" $((10#$(date +%H)*60 + 10#$(date +%M)))"
+        OUTPUT_VARIABLE M65_BUILD_TIME
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+endif()
 execute_process(
     COMMAND git rev-parse --short=8 HEAD
     WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}"
@@ -119,6 +127,7 @@ endif()
 
 target_link_libraries(pico_m65jtag
     pico_stdlib
+    pico_rand
     hardware_uart
     hardware_gpio
     hardware_timer
@@ -232,6 +241,7 @@ pico_add_extra_outputs(pico_m65jtag)
 if(M65_BUILD_FACTORY_BOOTLOADER)
     add_executable(m65_factory_bootloader
         bootloader/main.c
+        bootloader/ota_install.c
     )
     target_compile_definitions(m65_factory_bootloader PRIVATE
         M65_BOOTLOADER_SLOT0_OFFSET=${M65_BOOTLOADER_SLOT0_OFFSET}
@@ -246,6 +256,7 @@ if(M65_BUILD_FACTORY_BOOTLOADER)
     if(M65_BOOT_DIAG_PIN)
         target_compile_definitions(m65_factory_bootloader PRIVATE M65_BOOT_DIAG_PIN=${M65_BOOT_DIAG_PIN})
     endif()
+    target_include_directories(m65_factory_bootloader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(m65_factory_bootloader
         pico_stdlib
         hardware_gpio

@@ -153,6 +153,13 @@ bool remote_http_firmware_update(char *err, size_t err_len)
     if (err && err_len) snprintf(err, err_len, "wifi/SD firmware update support is not built");
     return false;
 }
+void remote_http_firmware_reboot(uint32_t delay_ms) { (void)delay_ms; }
+bool remote_http_verify_firmware_package(const char *path, char *err, size_t err_len)
+{
+    (void)path;
+    if (err && err_len) snprintf(err, err_len, "wifi/SD firmware update support is not built");
+    return false;
+}
 const char *remote_http_theme_status(void) { return "theme=unsupported"; }
 bool remote_http_theme_install(char *err, size_t err_len)
 {
@@ -275,6 +282,7 @@ typedef struct {
     char version[48];
     char build[64];
     char name[48];
+    bool universal;   // from a "#+" line: a universal (all-chip) firmware package
 } manifest_entry_t;
 
 typedef enum {
@@ -2015,8 +2023,8 @@ static void substitution_value(const char *name,
 #ifdef M65_BOOTLOADER_APP
             snprintf(out, out_len,
                      "<section class=\"update-panel firmware-update\"><strong>New firmware is available: %s</strong>"
-                     "<span>Build %s</span><form method=\"get\" action=\"/firmware/update\">"
-                     "<button type=\"submit\">Update and reboot</button></form></section>",
+                     "<span>Build %s</span><form onsubmit=\"return false\">"
+                     "<button type=\"button\" onclick=\"m65FwUpdate(this)\">Update and reboot</button></form></section>",
                      version, build);
 #else
             snprintf(out, out_len,
@@ -2614,11 +2622,15 @@ static err_t send_firmware_update(http_conn_t *c)
     if (!check_perm(c, REMOTE_AUTH_FILES)) {
         return send_error(c, 403, "Forbidden", "firmware updates are not authorised");
     }
+    if (!check_write_grant()) return send_error(c, 423, "Locked", "write grant is not active");
     char err[128];
     if (!remote_http_firmware_update(err, sizeof err)) {
-        return send_error(c, 501, "Not Implemented", err[0] ? err : "firmware update failed");
+        return send_error(c, 500, "Internal Server Error", err[0] ? err : "firmware update failed");
     }
-    return send_redirect(c, "/index.html");
+    // Staged and verified: reply first, then restart into the bootloader
+    err_t ret = send_response(c, 200, "OK", "text/plain", "OK FWUPDATE STAGED; restarting\n");
+    remote_http_firmware_reboot(1500);
+    return ret;
 }
 
 static err_t send_theme_install(http_conn_t *c)
@@ -2639,28 +2651,60 @@ static err_t send_theme_install(http_conn_t *c)
 }
 
 // Built into the firmware (not WWW/app.js) so it works whatever is, or isn't,
-// on the card. Polls /sd-state and reloads the page as soon as the card's
-// generation changes (card swapped or removed, or files added, deleted or
-// renamed by anyone), so the list is never stale and nobody has to click.
+// on the card. Polls /sd-state every 3 s and:
+//  - reloads the page when the SD generation changes (card swapped or removed,
+//    files added, deleted or renamed) or the boot ID changes (the Pico
+//    restarted, e.g. after a firmware update), so nobody has to click;
+//  - updates the "Write grant" line in place, so pressing the write-enable
+//    button shows up without a reload.
 // It holds off while window.m65Busy is set: the page's own upload/delete
 // sequence is running and will reload by itself when it finishes. The
 // server handles one connection at a time, so polling also pauses briefly
 // after any click/submit to keep the user's own request from colliding.
+// m65FwUpdate() drives the firmware panel's button: PUT /firmware/update,
+// then wait for the board to come back with a new boot ID and reload.
 static const char sd_watch_script_fmt[] =
     "<script>(function(){"
-    "var g='%lu',quietUntil=0;"
+    "var g='%lu',bid='%08lx',quietUntil=0;"
     "function quiet(){quietUntil=Date.now()+8000;}"
     "document.addEventListener('click',quiet,true);"
     "document.addEventListener('submit',quiet,true);"
+    "function field(t,k){var m=new RegExp('(?:^|\\\\s)'+k+'=(\\\\S+)').exec(t);return m?m[1]:null;}"
+    "function showGrant(t){"
+    "if(field(t,'grant_required')!=='1')return;"
+    "var s=document.querySelector('section.grant');if(!s)return;"
+    "var n=parseInt(field(t,'grant'),10)||0,on=n>0,spans=s.getElementsByTagName('span');"
+    "var policy=spans.length?spans[spans.length-1].outerHTML:'';"
+    "s.className=(s.className.replace(/\\bgrant-(active|inactive)\\b/g,'')+' grant-'+(on?'active':'inactive'))"
+    ".replace(/\\s+/g,' ').trim();"
+    "s.innerHTML='<strong>Write grant:</strong> '+(on?'active':'inactive')+' <span>'+"
+    "(on?n+' seconds remaining':'Press button above user-port to enable writing')+'</span>'+policy;}"
+    "function sdState(cb,timeout){"
+    "var x=new XMLHttpRequest();x.open('GET','/sd-state',true);x.timeout=timeout;"
+    "x.onload=function(){cb(x.status===200?x.responseText:null);};"
+    "x.onerror=x.ontimeout=function(){cb(null);};x.send();}"
     "function poll(){"
     "if(document.hidden||window.m65Busy||Date.now()<quietUntil)return;"
-    "var x=new XMLHttpRequest();x.open('GET','/sd-state',true);x.timeout=4000;"
-    "x.onload=function(){if(x.status!==200||window.m65Busy)return;"
-    "var m=/gen=(\\d+)/.exec(x.responseText);"
-    "if(m&&m[1]!==g)location.reload();};"
-    "x.send();}"
+    "sdState(function(t){if(!t||window.m65Busy)return;"
+    "var gen=field(t,'gen'),boot=field(t,'boot');"
+    "if((gen&&gen!==g)||(boot&&boot!==bid)){location.reload();return;}"
+    "showGrant(t);},4000);}"
     "document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});"
     "setInterval(poll,3000);"
+    "window.m65FwUpdate=function(b){"
+    "if(!confirm('Install the new firmware and restart the board?\\n\\n"
+    "Keep the power on until this page comes back.'))return;"
+    "window.m65Busy=true;b.disabled=true;b.textContent='Installing... keep the power on';"
+    "fetch('/firmware/update',{method:'PUT',cache:'no-store'}).then(function(r){"
+    "return r.text().then(function(t){if(!r.ok)throw new Error(t.split('\\n')[1]||t);"
+    "b.textContent='Restarting...';var t0=Date.now();"
+    "function wait(){sdState(function(s){var boot=s&&field(s,'boot');"
+    "if(boot&&boot!==bid){location.reload();return;}"
+    "if(Date.now()-t0>180000){b.textContent='Board did not come back; reload this page';return;}"
+    "setTimeout(wait,2000);},2500);}"
+    "setTimeout(wait,4000);});"
+    "}).catch(function(e){window.m65Busy=false;b.disabled=false;b.textContent='Update and reboot';"
+    "alert('Firmware update failed: '+e.message);});};"
     "})();</script>\n";
 
 static void page_insert_before_body_end(page_builder_t *pb, const char *snippet)
@@ -2686,11 +2730,14 @@ static err_t send_sd_state(http_conn_t *c)
     if (!check_perm(c, REMOTE_AUTH_FILES) && !check_perm(c, REMOTE_AUTH_BITSTREAMS)) {
         return send_error(c, 403, "Forbidden", "remote IP is not authorised");
     }
-    char body[64];
-    snprintf(body, sizeof body, "present=%u mounted=%u gen=%lu\n",
+    char body[128];
+    snprintf(body, sizeof body, "present=%u mounted=%u gen=%lu boot=%08lx grant=%lu grant_required=%u\n",
              storage_sd_card_present() ? 1u : 0u,
              storage_is_mounted() ? 1u : 0u,
-             (unsigned long)storage_media_generation());
+             (unsigned long)storage_media_generation(),
+             (unsigned long)m65_boot_id(),
+             (unsigned long)(write_gate_remaining_ms() / 1000u),
+             http_cfg.require_write_grant ? 1u : 0u);
     return send_response(c, 200, "OK", "text/plain", body);
 }
 
@@ -2760,8 +2807,9 @@ static err_t send_index(http_conn_t *c, uint8_t board_rev)
         page_append(&pb, "<tr><td colspan=\"4\">List truncated</td></tr>\n");
     }
     append_template_or_fallback(&pb, "WWW/index_bottom.html", default_bottom, NULL, NULL, dir_path, 0, false, NULL, board_rev);
-    char sd_watch[sizeof sd_watch_script_fmt + 16];
-    snprintf(sd_watch, sizeof sd_watch, sd_watch_script_fmt, (unsigned long)gen_at_listing);
+    static char sd_watch[sizeof sd_watch_script_fmt + 16];   // static: too big for the 2 KB stack
+    snprintf(sd_watch, sizeof sd_watch, sd_watch_script_fmt,
+             (unsigned long)gen_at_listing, (unsigned long)m65_boot_id());
     page_insert_before_body_end(&pb, sd_watch);
     err_t ret = send_response(c, 200, "OK", "text/html; charset=utf-8", page_buf);
     free(page_buf);
@@ -3249,8 +3297,11 @@ static err_t parse_headers(http_conn_t *c)
         return send_redirect(c, "/index.html");
     }
 
-    if ((ci_equal(c->method, "GET") || ci_equal(c->method, "PUT")) &&
-        ci_equal(target_path, "/firmware/update")) {
+    if (ci_equal(target_path, "/firmware/update")) {
+        // PUT only: a GET link could be followed by a crawler or a browser prefetch
+        if (!ci_equal(c->method, "PUT")) {
+            return send_error(c, 405, "Method Not Allowed", "use the Update button (PUT) to install firmware");
+        }
         return send_firmware_update(c);
     }
 
@@ -4520,7 +4571,20 @@ static bool parse_manifest_entry(char *line,
 
     char *s = line;
     while (*s && isspace((unsigned char)*s)) s++;
-    if (!*s || *s == '#') return true;
+
+    // "#+" lines carry entries that firmware from before universal UF2s must
+    // not see: it skips every '#' line, while an unknown type on an ordinary
+    // line would abort its whole scan. Only universal firmware uses this so
+    // far; anything else after "#+" is skipped, so the mirror can add more
+    // later without breaking this firmware either.
+    bool extended = false;
+    if (s[0] == '#' && s[1] == '+') {
+        extended = true;
+        s += 2;
+        while (*s && isspace((unsigned char)*s)) s++;
+    } else if (!*s || *s == '#') {
+        return true;
+    }
 
     char *cursor = s;
     char *first = manifest_next_token(&cursor);
@@ -4531,7 +4595,14 @@ static bool parse_manifest_entry(char *line,
     char *rel = NULL;
     manifest_kind_t kind = MANIFEST_KIND_CORE;
 
-    if (is_hex64_token(first)) {
+    if (extended) {
+        manifest_kind_t ext_kind;
+        if (!parse_manifest_kind(first, &ext_kind) || ext_kind != MANIFEST_KIND_FIRMWARE) return true;
+        kind = ext_kind;
+        payload_hash = manifest_next_token(&cursor);
+        transfer_hash = manifest_next_token(&cursor);
+        rel = manifest_next_token(&cursor);
+    } else if (is_hex64_token(first)) {
         payload_hash = first;
         transfer_hash = manifest_next_token(&cursor);
         rel = manifest_next_token(&cursor);
@@ -4569,26 +4640,45 @@ static bool parse_manifest_entry(char *line,
     snprintf(entry->transfer_sha, sizeof entry->transfer_sha, "%s", transfer_hash);
     snprintf(entry->rel, sizeof entry->rel, "%s", rel);
     parse_manifest_attrs(cursor, entry);
+    entry->universal = extended;
     if (skip) *skip = false;
     return true;
+}
+
+// Set by count_manifest_entries() before each scan. When the manifest offers a
+// universal firmware package, this firmware takes it and ignores the
+// single-chip "firmware" entry kept for older firmware; both would otherwise
+// download to the same path and replace each other on every fetch.
+static bool autofetch_manifest_has_universal_fw;
+
+static bool manifest_entry_superseded(const manifest_entry_t *entry)
+{
+    return entry->kind == MANIFEST_KIND_FIRMWARE && !entry->universal &&
+           autofetch_manifest_has_universal_fw;
 }
 
 static uint32_t count_manifest_entries(void)
 {
     uint32_t offset = 0;
-    uint32_t total = 0;
+    uint32_t total = 0, single_chip_fw = 0;
     char line[512];
+    autofetch_manifest_has_universal_fw = false;
     for (;;) {
         bool eof = false;
-        if (!read_manifest_line(&offset, line, sizeof line, &eof)) return total;
-        if (eof) return total;
+        if (!read_manifest_line(&offset, line, sizeof line, &eof) || eof) break;
 
         manifest_entry_t entry;
         bool skip = true;
         char err[80];
-        if (!parse_manifest_entry(line, &entry, &skip, err, sizeof err)) return total;
-        if (!skip) total++;
+        if (!parse_manifest_entry(line, &entry, &skip, err, sizeof err)) break;
+        if (skip) continue;
+        total++;
+        if (entry.kind == MANIFEST_KIND_FIRMWARE) {
+            if (entry.universal) autofetch_manifest_has_universal_fw = true;
+            else single_chip_fw++;
+        }
     }
+    return autofetch_manifest_has_universal_fw ? total - single_chip_fw : total;
 }
 
 static bool autofetch_start_manifest(uint8_t board_rev)
@@ -4852,7 +4942,7 @@ static bool autofetch_scan_manifest(void)
                      "autofetch=failed stage=manifest-scan reason=\"%s\"", err);
             return false;
         }
-        if (skip) continue;
+        if (skip || manifest_entry_superseded(&entry)) continue;
 
         autofetch_checked_count++;
         const char *final_path = manifest_final_path(entry.kind, entry.rel);
@@ -5881,6 +5971,20 @@ bool remote_http_firmware_update(char *err, size_t err_len)
     if (err && err_len) snprintf(err, err_len, "OTA firmware updates require M65_BOOTLOADER_APP");
     return false;
 }
+void remote_http_firmware_reboot(uint32_t delay_ms) { (void)delay_ms; }
 #endif
+
+bool remote_http_verify_firmware_package(const char *path, char *err, size_t err_len)
+{
+    // Mirror packages carry a signed trailer, kept on SD so it can be checked
+    // again here. A trailer that is present must verify; an unsigned package
+    // is accepted only when the config does not require signatures.
+    if (!signed_file_verify_stored(&http_cfg, path, M65_SIGNED_FILE_FIRMWARE,
+                                   http_cfg.require_signatures)) {
+        if (err && err_len) snprintf(err, err_len, "firmware signature check failed: %s", signed_file_last_error());
+        return false;
+    }
+    return true;
+}
 
 #endif

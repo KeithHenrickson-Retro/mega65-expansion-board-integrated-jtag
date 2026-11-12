@@ -27,7 +27,18 @@ uint32_t remote_http_autofetch_last_success_seconds(void);
 bool remote_http_autofetch_running(void);
 const char *remote_http_firmware_status(void);
 bool firmware_update_available(void);
+// Checks the staged package and writes it to flash slot 1 with an install
+// record. Does not reboot; on success call remote_http_firmware_reboot().
 bool remote_http_firmware_update(char *err, size_t err_len);
+// Restarts into the bootloader (which installs the update) after delay_ms.
+void remote_http_firmware_reboot(uint32_t delay_ms);
+// Random, non-zero, chosen at each power-up or restart (src/main.c). Reported
+// in /sd-state and AT+SDCARD? so the web page and the MEGA65 core loader can
+// tell that the Pico restarted, e.g. after a firmware update: the SD change
+// counter restarts too and could land on the value they last saw.
+uint32_t m65_boot_id(void);
+// Checks the package's signed trailer, following the require_signatures policy.
+bool remote_http_verify_firmware_package(const char *path, char *err, size_t err_len);
 const char *remote_http_theme_status(void);
 bool remote_http_theme_install(char *err, size_t err_len);
 bool remote_http_theme_install_named(const char *theme_name, char *err, size_t err_len);

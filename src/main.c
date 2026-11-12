@@ -19,6 +19,7 @@
 #include "remote_auth.h"
 #include "remote_http.h"
 #include "write_gate.h"
+#include "pico/rand.h"
 
 #ifndef M65_WRITE_ENABLE_PIN
 #define M65_WRITE_ENABLE_PIN 255u
@@ -973,12 +974,13 @@ static void cmd_sd_transport(char *arg)
 static void cmd_sdcard(void)
 {
     sdcard_state_t state = sdcard_state();
-    uart_cmd_printf("+SDCARD: state=%s mounted=%lu config_loaded=%lu transport=%s gen=%lu\r\n",
+    uart_cmd_printf("+SDCARD: state=%s mounted=%lu config_loaded=%lu transport=%s gen=%lu boot=%08lx\r\n",
                     sdcard_state_token(state),
                     (unsigned long)(storage_is_mounted() ? 1u : 0u),
                     (unsigned long)(sd_config_loaded ? 1u : 0u),
                     storage_sd_transport_name(),
-                    (unsigned long)storage_media_generation());
+                    (unsigned long)storage_media_generation(),
+                    (unsigned long)m65_boot_id());
     at_ok();
 }
 
@@ -1183,6 +1185,9 @@ static void cmd_firmware_status(void)
 
 static void cmd_firmware_update(void)
 {
+    // Same rule as the other write commands: USB only, with the physical
+    // write-enable asserted, so the MEGA65-side UART cannot replace firmware
+    if (!require_write_authority("FWUPDATE")) return;
     if (remote_http_autofetch_running()) {
         at_error("BUSY FETCHING");
         return;
@@ -1192,7 +1197,9 @@ static void cmd_firmware_update(void)
         at_error(err[0] ? err : "FIRMWARE UPDATE FAILED");
         return;
     }
+    uart_cmd_puts("+FWUPDATE: staged and verified; restarting to install\r\n");
     at_ok();
+    remote_http_firmware_reboot(500);
 }
 
 static void cmd_theme_status(void)
@@ -2560,8 +2567,16 @@ static void dispatch(char *line)
 #endif
 }
 
+static uint32_t boot_id;
+
+uint32_t m65_boot_id(void)
+{
+    return boot_id;
+}
+
 int main(void)
 {
+    do boot_id = get_rand_32(); while (boot_id == 0);
 #if M65_BOOT_DIAG
     boot_diag_uart_init();
     boot_diag_pin_init();
@@ -2609,6 +2624,9 @@ int main(void)
     char line[256];
     for (;;) {
         bootsel_button_poll();
+        // Watch the write-enable button all the time: otherwise a press only
+        // counts if something happens to ask about the grant while it is held
+        write_gate_refresh_from_pin();
         if (uart_cmd_read_line(line, sizeof line)) {
             dispatch(line);
             continue;
