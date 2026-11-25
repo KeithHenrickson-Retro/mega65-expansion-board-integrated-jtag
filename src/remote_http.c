@@ -87,6 +87,10 @@
 #ifndef M65_HTTP_TEMPLATE_CHUNK
 #define M65_HTTP_TEMPLATE_CHUNK 128u
 #endif
+#ifndef M65_HTTP_INDEX_ROW_RESERVE
+/* Worst-case bytes one index row (plus the closing template) may need. */
+#define M65_HTTP_INDEX_ROW_RESERVE 4096u
+#endif
 #ifndef M65_HTTP_INDEX_MAX_ROWS
 #define M65_HTTP_INDEX_MAX_ROWS 100u
 #endif
@@ -192,6 +196,7 @@ typedef enum {
     HTTP_RECV_HEADERS = 0,
     HTTP_RECV_BODY,
     HTTP_SEND_FILE,
+    HTTP_SEND_BUFFER,
     HTTP_CLOSING,
     HTTP_CLOSED,
 } http_state_t;
@@ -226,6 +231,9 @@ typedef struct {
     uint32_t file_offset;
     uint32_t file_size;
     const uint8_t *mem_data;   // HTTP_SEND_FILE from memory (built-in WWW file) instead of SD
+    char *send_buf;     /* heap response body streamed via tcp_sent; owned by conn */
+    size_t send_len;
+    size_t send_off;
     jtag_stream_writer_t jtag;
     signed_file_rx_t signed_rx;
 } http_conn_t;
@@ -357,6 +365,7 @@ static bool autofetch_start_manifest(uint8_t board_rev);
 static void close_http_listener(void);
 static bool ensure_parent_dirs(const char *path);
 static err_t http_sent(void *arg, struct tcp_pcb *pcb, u16_t len);
+static err_t send_buffer_start(http_conn_t *c, char *buf, size_t len);
 static err_t http_poll_cb(void *arg, struct tcp_pcb *pcb);
 static void html_escape(const char *in, char *out, size_t out_len);
 
@@ -2331,7 +2340,7 @@ static void append_template_or_fallback(page_builder_t *pb,
 static bool index_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
     index_list_ctx_t *il = (index_list_ctx_t *)ctx;
-    if (il->pb->len + 512u >= il->pb->cap) {
+    if (il->pb->len + M65_HTTP_INDEX_ROW_RESERVE >= il->pb->cap) {
         il->truncated = true;
         return true;
     }
@@ -2363,9 +2372,20 @@ static bool index_cb(const char *name, uint32_t size, bool is_dir, const storage
     return true;
 }
 
+static void http_free_send_buf(http_conn_t *c)
+{
+    if (!c) return;
+    free(c->send_buf);
+    c->send_buf = NULL;
+    c->send_len = 0;
+    c->send_off = 0;
+}
+
 static err_t http_close(http_conn_t *c)
 {
-    if (!c || !c->pcb) return ERR_OK;
+    if (!c) return ERR_OK;
+    http_free_send_buf(c);
+    if (!c->pcb) return ERR_OK;
     if (c->state != HTTP_CLOSING &&
         (c->put_op == HTTP_PUT_FILE || c->jtag_spool) && c->state == HTTP_RECV_BODY) {
         signed_file_receive_abort(&c->signed_rx);
@@ -2419,6 +2439,37 @@ static bool tcp_write_copy(http_conn_t *c, const void *data, size_t len)
     return true;
 }
 
+/* Queue as much of c->send_buf as lwIP will take now; the rest is pushed from
+ * http_sent/http_poll_cb as ACKs free send-buffer space. */
+static err_t send_buffer_chunk(http_conn_t *c)
+{
+    if (!c || !c->pcb || c->state != HTTP_SEND_BUFFER) return ERR_OK;
+    while (c->send_off < c->send_len) {
+        u16_t snd = tcp_sndbuf(c->pcb);
+        if (snd == 0) break;
+        size_t want = c->send_len - c->send_off;
+        u16_t chunk = want > snd ? snd : (u16_t)want;
+        err_t err = tcp_write(c->pcb, c->send_buf + c->send_off, chunk, TCP_WRITE_FLAG_COPY);
+        if (err == ERR_MEM) break; /* queue full; retry on next sent/poll */
+        if (err != ERR_OK) return http_close(c);
+        c->send_off += chunk;
+    }
+    tcp_output(c->pcb);
+    if (c->send_off >= c->send_len) return http_close(c);
+    return ERR_OK;
+}
+
+/* Takes ownership of buf (malloc'd); headers must already be queued. */
+static err_t send_buffer_start(http_conn_t *c, char *buf, size_t len)
+{
+    http_free_send_buf(c);
+    c->send_buf = buf;
+    c->send_len = len;
+    c->send_off = 0;
+    c->state = HTTP_SEND_BUFFER;
+    return send_buffer_chunk(c);
+}
+
 static err_t send_response_bytes(http_conn_t *c,
                                  int code,
                                  const char *reason,
@@ -2437,8 +2488,17 @@ static err_t send_response_bytes(http_conn_t *c,
              code, reason, content_type ? content_type : "text/plain",
              (unsigned long)body_len);
     if (!tcp_write_copy(c, header, strlen(header))) return http_close(c);
-    if (body_len && body && !tcp_write_copy(c, body, body_len)) return http_close(c);
-    return http_close(c);
+    if (!body_len || !body) return http_close(c);
+    if (body_len <= tcp_sndbuf(c->pcb)) {
+        if (!tcp_write_copy(c, body, body_len)) return http_close(c);
+        return http_close(c);
+    }
+    /* Body is larger than the TCP send buffer: keep a copy and stream it as
+     * the peer ACKs, instead of silently truncating the response. */
+    char *copy = (char *)malloc(body_len);
+    if (!copy) return http_close(c);
+    memcpy(copy, body, body_len);
+    return send_buffer_start(c, copy, body_len);
 }
 
 static err_t send_response(http_conn_t *c,
@@ -2858,9 +2918,22 @@ static err_t send_index(http_conn_t *c, uint8_t board_rev)
     snprintf(sd_watch, sizeof sd_watch, sd_watch_script_fmt,
              (unsigned long)gen_at_listing, (unsigned long)m65_boot_id());
     page_insert_before_body_end(&pb, sd_watch);
-    err_t ret = send_response(c, 200, "OK", "text/html; charset=utf-8", page_buf);
-    free(page_buf);
-    return ret;
+
+    char header[256];
+    snprintf(header, sizeof header,
+             "HTTP/1.0 200 OK\r\n"
+             "Connection: close\r\n"
+             "Content-Type: text/html; charset=utf-8\r\n"
+             "Content-Length: %lu\r\n"
+             "Cache-Control: no-store\r\n"
+             "\r\n",
+             (unsigned long)pb.len);
+    if (!tcp_write_copy(c, header, strlen(header))) {
+        free(page_buf);
+        return http_close(c);
+    }
+    /* The page is usually far larger than TCP_SND_BUF, so stream it. */
+    return send_buffer_start(c, page_buf, pb.len);
 }
 
 static err_t send_file_chunk(http_conn_t *c)
@@ -3544,6 +3617,7 @@ static err_t http_sent(void *arg, struct tcp_pcb *pcb, u16_t len)
     (void)len;
     http_conn_t *c = (http_conn_t *)arg;
     if (c && c->state == HTTP_SEND_FILE) return send_file_chunk(c);
+    if (c && c->state == HTTP_SEND_BUFFER) return send_buffer_chunk(c);
     if (c && c->state == HTTP_CLOSING) return http_close(c);
     return ERR_OK;
 }
@@ -3553,6 +3627,7 @@ static err_t http_poll_cb(void *arg, struct tcp_pcb *pcb)
     (void)pcb;
     http_conn_t *c = (http_conn_t *)arg;
     if (c && c->state == HTTP_SEND_FILE) return send_file_chunk(c);
+    if (c && c->state == HTTP_SEND_BUFFER) return send_buffer_chunk(c);
     if (c && c->state == HTTP_CLOSING) return http_close(c);
     return ERR_OK;
 }
@@ -3564,6 +3639,7 @@ static void http_err(void *arg, err_t err)
     if (!c) return;
     if (c->jtag_active) jtag_program_writer_abort(&c->jtag);
     if (c->put_op == HTTP_PUT_FILE || c->jtag_spool) signed_file_receive_abort(&c->signed_rx);
+    free(c->send_buf);
     memset(c, 0, sizeof *c);
 }
 
